@@ -1,0 +1,46 @@
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments (uv creates .venv)
+.venv/
+venv/
+.env
+
+# Test, coverage and lint caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights live outside the repo (see README); keep them out even if
+# one gets dropped in here by accident.
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Emacs
+*~
+\#*\#
+.\#*
+*.elc
+flycheck_*.el
+.projectile
+auto-save-list/
+tramp
+
+# Other editors
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

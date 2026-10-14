@@ -1,0 +1,36 @@
+[project]
+name = "upscale-mcp"
+version = "0.1.0"
+description = "MCP server that runs open-weight image upscaling models locally (spandrel + PyTorch, Apple MPS)"
+readme = "README.md"
+# PEP 639 licence metadata (SPDX expression plus the file that ships with it).
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# torch publishes macOS arm64 wheels for these versions; .python-version pins
+# uv to 3.12 so it never picks a newer Python that torch has no wheel for yet.
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # 2.x renamed FastMCP to MCPServer; server.py uses the 2.x names.
+    "mcp>=2,<3",
+    "torch>=2.4",
+    "spandrel>=0.4",
+    "pillow>=10.1",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+upscale-mcp = "upscale_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+# 1.27 is the first hatchling release that understands PEP 639 licence fields.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/upscale_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
