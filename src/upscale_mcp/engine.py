@@ -7,6 +7,9 @@ Pipeline for one call:
 
     load_image()  ->  upscale_array()  ->  optional LANCZOS resize  ->  save_image()
 
+Images are 8-bit or 16-bit end to end, following the source (see the Image
+I/O section for which formats carry more than 8 bits and how).
+
 upscale_array() runs the model tile by tile. Each tile is cut from the source
 with an extra `overlap` margin of context on every side, run through the model,
 and only the scaled-up *core* of the tile (without the margin) is written into
@@ -307,25 +310,25 @@ def upscale_array(
     overlap: int = 32,
     progress: ProgressFn | None = None,
 ) -> np.ndarray:
-    """Run `model` over an H x W x 3 uint8 image; return (H*scale) x (W*scale) x 3 uint8.
+    """Run `model` over an H x W x 3 image; return (H*scale) x (W*scale) x 3 of the same dtype.
+
+    The image may be uint8 (0..255) or uint16 (full 0..65535 range, see
+    load_image). Models work in float [0, 1] either way, so a 16-bit source
+    simply reaches the model with finer steps and the result keeps them.
 
     `model` takes and returns BCHW float tensors in [0, 1] on `device`
     (spandrel's ImageModelDescriptor is such a callable). The source stays on
-    the CPU as uint8; only one context-padded tile at a time is moved to the
-    device, which keeps GPU memory proportional to the tile size, not the
-    image size. The output is assembled on the CPU as uint8.
+    the CPU in its integer form; each context-padded tile is converted to
+    float32 in numpy and moved to the device on its own, which keeps GPU
+    memory proportional to the tile size, not the image size. (Converting in
+    numpy also avoids torch's limited uint16 support.) The output is
+    assembled on the CPU in the source dtype.
     """
-    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
-        raise ValueError(f"expected H x W x 3 uint8, got {rgb.shape} {rgb.dtype}")
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype not in (np.uint8, np.uint16):
+        raise ValueError(f"expected H x W x 3 uint8 or uint16, got {rgb.shape} {rgb.dtype}")
+    maxval = float(np.iinfo(rgb.dtype).max)
     height, width = rgb.shape[:2]
-    out = np.empty((height * scale, width * scale, 3), dtype=np.uint8)
-    # torch.from_numpy shares memory and warns on read-only arrays (which is
-    # what np.asarray(PIL image) returns), so copy those; the source is never
-    # written to, but a copy keeps the log clean and costs only H*W*3 bytes.
-    rgb = np.ascontiguousarray(rgb)
-    if not rgb.flags.writeable:
-        rgb = rgb.copy()
-    src = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)  # 1x3xHxW uint8
+    out = np.empty((height * scale, width * scale, 3), dtype=rgb.dtype)
     dtype = torch.float16 if half else torch.float32
     tiles = tile_grid(height, width, tile)
 
@@ -335,7 +338,8 @@ def upscale_array(
             # clamped to the image.
             cy0, cx0 = max(0, y0 - overlap), max(0, x0 - overlap)
             cy1, cx1 = min(height, y1 + overlap), min(width, x1 + overlap)
-            patch = src[:, :, cy0:cy1, cx0:cx1].to(device=device, dtype=dtype) / 255.0
+            chw = rgb[cy0:cy1, cx0:cx1].transpose(2, 0, 1).astype(np.float32) / maxval
+            patch = torch.from_numpy(chw).unsqueeze(0).to(device=device, dtype=dtype)
             ph, pw = patch.shape[2], patch.shape[3]
             result = model(_pad_for_model(patch, size_req))
             # Drop any model-size padding, then keep only the scaled core.
@@ -346,9 +350,12 @@ def upscale_array(
                 (y0 - cy0) * scale : (y1 - cy0) * scale,
                 (x0 - cx0) * scale : (x1 - cx0) * scale,
             ]
-            # Round in float32 regardless of compute precision.
-            block = (result.float().clamp_(0, 1) * 255.0).round_().to(torch.uint8)
-            out[y0 * scale : y1 * scale, x0 * scale : x1 * scale] = block[0].permute(1, 2, 0).cpu().numpy()
+            # Round in float32 regardless of compute precision; go through
+            # int32 because torch's uint16 support is limited.
+            block = (result.float().clamp_(0, 1) * maxval).round_().to(torch.int32)
+            out[y0 * scale : y1 * scale, x0 * scale : x1 * scale] = (
+                block[0].permute(1, 2, 0).cpu().numpy().astype(rgb.dtype)
+            )
             if progress is not None:
                 progress(i + 1, len(tiles))
     return out
@@ -357,22 +364,168 @@ def upscale_array(
 # --------------------------------------------------------------------------
 # Image I/O
 # --------------------------------------------------------------------------
+#
+# Images travel through the pipeline as uint8 (8-bit sources) or uint16 using
+# the full 0..65535 range (anything deeper than 8 bits: 10/12-bit HEIF,
+# 16-bit PNG and TIFF). The output keeps the source's depth where the output
+# format can hold it (PNG, TIFF) and is rounded to 8 bits otherwise (JPEG,
+# WebP), with a warning.
+#
+# Readers:
+#   .heic/.heif/.avif   pillow-heif, at the file's own bit depth
+#   >8-bit .png/.tif    OpenCV for the pixels, because Pillow silently
+#                       truncates 48/64-bit RGB PNGs and TIFFs to 8 bits;
+#                       Pillow still supplies the metadata (ICC profile,
+#                       EXIF orientation)
+#   everything else     Pillow, 8 bits, as before
+# Writers:
+#   8-bit               Pillow, as before
+#   16-bit .png         OpenCV, with the ICC profile added as an iCCP chunk
+#                       (OpenCV cannot write one itself)
+#   16-bit .tif         tifffile, with the ICC profile in its standard tag
+
+HEIF_SUFFIXES = (".heic", ".heif", ".avif")
 
 
 @dataclass
 class LoadedImage:
-    rgb: np.ndarray  # H x W x 3 uint8
-    alpha: np.ndarray | None  # H x W uint8, or None when the image is opaque
+    rgb: np.ndarray  # H x W x 3, uint8, or uint16 over the full 0..65535 range
+    alpha: np.ndarray | None  # H x W, same dtype as rgb, or None when opaque
     icc_profile: bytes | None  # embedded colour profile, carried to the output
-    source_mode: str  # PIL mode of the file, for reporting
+    source_mode: str  # how the file was encoded, for reporting
+    source_bits: int  # bits per channel in the file: 8, 10, 12 or 16
+    warnings: list[str]
 
     @property
     def size(self) -> tuple[int, int]:
         return self.rgb.shape[1], self.rgb.shape[0]  # (width, height), PIL order
 
 
+def expand_to_16(a: np.ndarray, bits: int) -> np.ndarray:
+    """Rescale `bits`-deep codes stored left-aligned in uint16 to the full 0..65535 range.
+
+    pillow-heif returns 10-bit data shifted into the top of 16 bits, so white
+    is 1023 << 6 = 65472, not 65535. Dividing that by 65535 would make every
+    pixel about 0.1% too dark. Shifting back down to the real codes and
+    rescaling so the brightest code becomes 65535 keeps white white.
+    """
+    if bits >= 16:
+        return a
+    codes = (a >> (16 - bits)).astype(np.uint32)
+    maxcode = (1 << bits) - 1
+    return ((codes * 65535 + maxcode // 2) // maxcode).astype(np.uint16)
+
+
+def to_8bit(a: np.ndarray) -> np.ndarray:
+    """Round full-range 16-bit values to 8 bits (65535 / 257 = 255 exactly)."""
+    if a.dtype == np.uint8:
+        return a
+    return ((a.astype(np.uint32) + 128) // 257).astype(np.uint8)
+
+
+def apply_orientation(a: np.ndarray, orientation: int) -> np.ndarray:
+    """Turn pixels upright according to an EXIF orientation value (1..8).
+
+    Matches PIL.ImageOps.exif_transpose, which handles the 8-bit path; this
+    is for arrays Pillow cannot hold (16-bit RGB).
+    """
+    if orientation == 2:
+        a = a[:, ::-1]
+    elif orientation == 3:
+        a = np.rot90(a, 2)
+    elif orientation == 4:
+        a = a[::-1]
+    elif orientation == 5:
+        a = a.swapaxes(0, 1)
+    elif orientation == 6:
+        a = np.rot90(a, -1)
+    elif orientation == 7:
+        a = np.rot90(a, 2).swapaxes(0, 1)
+    elif orientation == 8:
+        a = np.rot90(a, 1)
+    return np.ascontiguousarray(a)
+
+
+def _load_heif(path: Path) -> LoadedImage:
+    """HEIC / HEIF / AVIF through pillow-heif, keeping 10- and 12-bit data.
+
+    libheif applies the container's own rotation and mirroring (irot/imir)
+    while decoding; the HEIF spec says the EXIF orientation tag is to be
+    ignored, so it is not applied again here.
+    """
+    import pillow_heif
+
+    heif = pillow_heif.open_heif(path, convert_hdr_to_8bit=False)
+    bits = int(heif.info.get("bit_depth", 8))
+    arr = np.asarray(heif)
+    if arr.dtype == np.uint16:
+        arr = expand_to_16(arr, bits)
+    alpha = None
+    if arr.shape[2] == 4:
+        alpha = np.ascontiguousarray(arr[..., 3])
+        arr = arr[..., :3]
+    icc = heif.info.get("icc_profile")
+    warnings: list[str] = []
+    if not icc and heif.info.get("nclx_profile"):
+        # Colour described by an nclx box (primaries / transfer, e.g. an HDR
+        # PQ or HLG photo) rather than an ICC profile. The pixels pass through
+        # unchanged, but the output carries no colour description.
+        warnings.append("source colour is described by an nclx box, not an ICC profile; the output has no profile")
+    return LoadedImage(
+        rgb=np.ascontiguousarray(arr),
+        alpha=alpha,
+        icc_profile=icc,
+        source_mode=f"HEIF {heif.mode}",
+        source_bits=bits,
+        warnings=warnings,
+    )
+
+
+def _bits_per_channel(path: Path, im: Image.Image) -> int:
+    """Bits per channel in a PNG or TIFF file, read from its header.
+
+    Pillow's mode does not tell: a 48-bit RGB PNG opens as plain "RGB".
+    """
+    if im.format == "PNG":
+        with open(path, "rb") as f:
+            header = f.read(25)
+        return header[24]  # IHDR bit depth: signature 8 + length 4 + type 4 + w 4 + h 4
+    if im.format == "TIFF":
+        bps = im.tag_v2.get(258, (8,))
+        return max(bps) if isinstance(bps, tuple) else int(bps)
+    return 8
+
+
+def _load_deep_with_cv2(path: Path, icc: bytes | None, orientation: int, source_mode: str, bits: int) -> LoadedImage:
+    import cv2
+
+    arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)  # no EXIF rotation applied
+    if arr is None:
+        raise ValueError(f"OpenCV could not read {path.name}")
+    if arr.dtype != np.uint16:
+        raise ValueError(f"{path.name}: {arr.dtype} samples are not supported (8- or 16-bit integer only)")
+    alpha = None
+    if arr.ndim == 2:
+        rgb = np.repeat(arr[..., None], 3, axis=2)
+    elif arr.shape[2] == 3:
+        rgb = arr[..., ::-1]  # OpenCV is BGR
+    elif arr.shape[2] == 4:
+        rgb = arr[..., 2::-1]
+        alpha = apply_orientation(arr[..., 3], orientation)
+    else:
+        raise ValueError(f"{path.name}: {arr.shape[2]} channels are not supported")
+    return LoadedImage(
+        rgb=apply_orientation(rgb, orientation),
+        alpha=alpha,
+        icc_profile=icc,
+        source_mode=f"{source_mode} {bits}-bit",
+        source_bits=bits,
+        warnings=[],
+    )
+
+
 def load_image(path: Path) -> LoadedImage:
-    """Read an image as 8-bit RGB plus optional alpha.
+    """Read an image as RGB plus optional alpha, 8-bit or 16-bit as the file is.
 
     The EXIF orientation is applied to the pixels (and so dropped from the
     output). Apps that honour the orientation tag, like PhotoCraft, show the
@@ -383,34 +536,112 @@ def load_image(path: Path) -> LoadedImage:
     placed back over the original. A CMYK source's profile is dropped
     because the pixels have been converted to RGB.
     """
+    if path.suffix.lower() in HEIF_SUFFIXES:
+        return _load_heif(path)
     with Image.open(path) as im:
-        im.load()
         source_mode = im.mode
-        im = ImageOps.exif_transpose(im)
         icc = im.info.get("icc_profile")
+        orientation = im.getexif().get(274, 1)
+        bits = _bits_per_channel(path, im)
+        if bits > 8 and im.format in ("PNG", "TIFF"):
+            return _load_deep_with_cv2(path, icc, orientation, f"{im.format} {source_mode}", bits)
+        im.load()
+        im = ImageOps.exif_transpose(im)
         if source_mode == "CMYK":
             icc = None
         has_alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
         alpha = np.asarray(im.convert("RGBA").getchannel("A")).copy() if has_alpha else None
         rgb = np.asarray(im.convert("RGB")).copy()
-    return LoadedImage(rgb=rgb, alpha=alpha, icc_profile=icc, source_mode=source_mode)
+    return LoadedImage(rgb=rgb, alpha=alpha, icc_profile=icc, source_mode=source_mode, source_bits=8, warnings=[])
+
+
+def _resize_plane_float(plane: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """LANCZOS-resize one channel through a 32-bit float PIL image.
+
+    Pillow cannot hold 16-bit RGB, but it resizes single-channel float ("F")
+    images with the same LANCZOS kernel the 8-bit path uses, so 16-bit images
+    are resized channel by channel at full precision.
+    """
+    return np.asarray(Image.fromarray(plane.astype(np.float32), "F").resize(size, Image.Resampling.LANCZOS))
 
 
 def resize_rgb(rgb: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """LANCZOS resize to (width, height).
+    """LANCZOS resize to (width, height), keeping the dtype.
 
     PIL's LANCZOS widens its kernel when shrinking, so a 4x reduction is
     properly anti-aliased rather than just sampled.
     """
     if (rgb.shape[1], rgb.shape[0]) == size:
         return rgb
-    return np.asarray(Image.fromarray(rgb, "RGB").resize(size, Image.Resampling.LANCZOS))
+    if rgb.dtype == np.uint8:
+        return np.asarray(Image.fromarray(rgb, "RGB").resize(size, Image.Resampling.LANCZOS))
+    planes = [_resize_plane_float(rgb[..., c], size) for c in range(3)]
+    return np.clip(np.rint(np.stack(planes, axis=2)), 0, 65535).astype(np.uint16)
 
 
 def resize_alpha(alpha: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     if (alpha.shape[1], alpha.shape[0]) == size:
         return alpha
-    return np.asarray(Image.fromarray(alpha, "L").resize(size, Image.Resampling.LANCZOS))
+    if alpha.dtype == np.uint8:
+        return np.asarray(Image.fromarray(alpha, "L").resize(size, Image.Resampling.LANCZOS))
+    return np.clip(np.rint(_resize_plane_float(alpha, size)), 0, 65535).astype(np.uint16)
+
+
+def _png_insert_iccp(png: bytes, icc: bytes) -> bytes:
+    """Add an iCCP chunk (the ICC profile) right after IHDR in an encoded PNG.
+
+    OpenCV, which writes the 16-bit PNGs, has no way to embed a profile.
+    iCCP must come before PLTE and IDAT; straight after IHDR satisfies that.
+    Any colour chunks the encoder wrote (sRGB, gAMA, cHRM) are dropped, since
+    the PNG spec gives the ICC profile the final word and they could only
+    contradict it.
+    """
+    import struct
+    import zlib
+
+    if png[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG stream")
+    out = [png[:8]]
+    pos = 8
+    while pos < len(png):
+        (length,) = struct.unpack(">I", png[pos : pos + 4])
+        ctype = png[pos + 4 : pos + 8]
+        chunk = png[pos : pos + 12 + length]
+        pos += 12 + length
+        if ctype in (b"iCCP", b"sRGB", b"gAMA", b"cHRM"):
+            continue
+        out.append(chunk)
+        if ctype == b"IHDR":
+            # Profile name, NUL, compression method 0 (zlib), compressed profile.
+            data = b"ICC Profile\x00\x00" + zlib.compress(icc)
+            crc = zlib.crc32(b"iCCP" + data) & 0xFFFFFFFF
+            out.append(struct.pack(">I", len(data)) + b"iCCP" + data + struct.pack(">I", crc))
+    return b"".join(out)
+
+
+def _write_png16(tmp: Path, rgb: np.ndarray, alpha: np.ndarray | None, icc: bytes | None) -> None:
+    import cv2
+
+    bgr = rgb[..., ::-1] if alpha is None else np.dstack([rgb[..., ::-1], alpha])
+    ok, buf = cv2.imencode(".png", np.ascontiguousarray(bgr), [cv2.IMWRITE_PNG_COMPRESSION, 6])
+    if not ok:
+        raise RuntimeError("16-bit PNG encoding failed")
+    data = buf.tobytes()
+    tmp.write_bytes(_png_insert_iccp(data, icc) if icc else data)
+
+
+def _write_tiff16(tmp: Path, rgb: np.ndarray, alpha: np.ndarray | None, icc: bytes | None) -> None:
+    import tifffile
+
+    data = rgb if alpha is None else np.dstack([rgb, alpha])
+    tifffile.imwrite(
+        tmp,
+        data,
+        photometric="rgb",
+        compression="zlib",
+        extrasamples=None if alpha is None else ("unassalpha",),
+        iccprofile=icc,
+    )
 
 
 def save_image(
@@ -421,7 +652,10 @@ def save_image(
     *,
     jpeg_quality: int = 95,
 ) -> list[str]:
-    """Write the result; the format comes from the file suffix.
+    """Write the result; the format comes from the file suffix, the depth from the data.
+
+    uint16 data is written as 16-bit PNG or TIFF; JPEG and WebP cannot hold
+    it, so for those it is rounded to 8 bits with a warning.
 
     The image is written to a hidden temporary file in the same folder and
     then renamed over the final name. A rename within one folder is atomic,
@@ -435,28 +669,40 @@ def save_image(
     suffix = path.suffix.lower()
     if suffix not in OUTPUT_SUFFIXES:
         raise ValueError(f"unsupported output type {suffix!r}; use one of {', '.join(OUTPUT_SUFFIXES)}")
-    im = Image.fromarray(rgb, "RGB")
-    if alpha is not None:
-        if suffix in (".jpg", ".jpeg"):
-            warnings.append("JPEG has no alpha channel; transparency was dropped")
-        else:
-            im.putalpha(Image.fromarray(alpha, "L"))
-    kwargs: dict = {}
-    if icc_profile:
-        kwargs["icc_profile"] = icc_profile
-    if suffix == ".png":
-        kwargs["compress_level"] = 6
-    elif suffix in (".jpg", ".jpeg"):
-        # 4:4:4 chroma: the point of the exercise is fine detail, so do not
-        # throw half the colour resolution away on save.
-        kwargs.update(quality=jpeg_quality, subsampling=0)
-    elif suffix in (".tif", ".tiff"):
-        kwargs["compression"] = "tiff_lzw"
-    elif suffix == ".webp":
-        kwargs["lossless"] = True
+    deep = rgb.dtype == np.uint16
+    if deep and suffix in (".jpg", ".jpeg", ".webp"):
+        warnings.append(f"{suffix} holds only 8 bits per channel; the 16-bit result was rounded to 8 bits")
+        rgb = to_8bit(rgb)
+        alpha = to_8bit(alpha) if alpha is not None else None
+        deep = False
+    if alpha is not None and suffix in (".jpg", ".jpeg"):
+        warnings.append("JPEG has no alpha channel; transparency was dropped")
+        alpha = None
+
     tmp = path.with_name(f".{path.name}.partial")
     try:
-        im.save(tmp, format=OUTPUT_FORMATS[suffix], **kwargs)
+        if deep and suffix == ".png":
+            _write_png16(tmp, rgb, alpha, icc_profile)
+        elif deep:  # .tif / .tiff
+            _write_tiff16(tmp, rgb, alpha, icc_profile)
+        else:
+            im = Image.fromarray(rgb, "RGB")
+            if alpha is not None:
+                im.putalpha(Image.fromarray(alpha, "L"))
+            kwargs: dict = {}
+            if icc_profile:
+                kwargs["icc_profile"] = icc_profile
+            if suffix == ".png":
+                kwargs["compress_level"] = 6
+            elif suffix in (".jpg", ".jpeg"):
+                # 4:4:4 chroma: the point of the exercise is fine detail, so do
+                # not throw half the colour resolution away on save.
+                kwargs.update(quality=jpeg_quality, subsampling=0)
+            elif suffix in (".tif", ".tiff"):
+                kwargs["compression"] = "tiff_lzw"
+            elif suffix == ".webp":
+                kwargs["lossless"] = True
+            im.save(tmp, format=OUTPUT_FORMATS[suffix], **kwargs)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)  # only still there if save or rename failed
@@ -475,6 +721,8 @@ class UpscaleResult:
     input_size: tuple[int, int]  # (width, height)
     model_output_size: tuple[int, int]
     output_size: tuple[int, int]
+    input_bits: int  # bits per channel in the source file
+    output_bits: int  # bits per channel written
     model: dict
     device: str
     half: bool
@@ -541,15 +789,19 @@ def upscale_file(
         final_size = (max(1, round(width * output_scale)), max(1, round(height * output_scale)))
     final_rgb = resize_rgb(upscaled, final_size)
     final_alpha = resize_alpha(image.alpha, final_size) if image.alpha is not None else None
-    warnings = save_image(dst, final_rgb, final_alpha, image.icc_profile, jpeg_quality=jpeg_quality)
+    warnings = list(image.warnings)
+    warnings += save_image(dst, final_rgb, final_alpha, image.icc_profile, jpeg_quality=jpeg_quality)
     if image.alpha is not None:
         warnings.append("alpha channel was resized with LANCZOS, not run through the model")
+    written_deep = final_rgb.dtype == np.uint16 and dst.suffix.lower() in (".png", ".tif", ".tiff")
     return UpscaleResult(
         input=str(src),
         output=str(dst),
         input_size=(width, height),
         model_output_size=model_size,
         output_size=final_size,
+        input_bits=image.source_bits,
+        output_bits=16 if written_deep else 8,
         model=info.as_dict(),
         device=str(device),
         half=half,

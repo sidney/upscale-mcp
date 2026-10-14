@@ -120,6 +120,12 @@ is loading.
 Outputs are written to a hidden temporary file and renamed into place, so a
 file that exists under its final name is always complete.
 
+Inputs can be anything Pillow reads, plus HEIC/HEIF/AVIF (through
+pillow-heif) and 16-bit PNG and TIFF. Images deeper than 8 bits, such as a
+phone's 10-bit HEIC, are processed at 16 bits throughout and written as
+16-bit PNG or TIFF. JPEG and WebP output is always 8-bit, with a warning if
+that rounds a deeper result. The reply reports `input_bits` and `output_bits`.
+
 The EXIF orientation is applied to the pixels and the ICC profile is copied
 to the output. Alpha is carried through with a plain LANCZOS resize, not the
 model.
@@ -150,5 +156,6 @@ The tests need no model weights or GPU: they check that tiled and
 single-pass output are identical for a model with a known receptive field,
 the padding for architectures with size requirements, progress reporting,
 path confinement, model-name resolution, the job queue (one at a time,
-cancelling queued and running jobs, refusing two jobs on one output) and
-atomic saves.
+cancelling queued and running jobs, refusing two jobs on one output),
+atomic saves, and the 16-bit path (10-bit HEIF scaling, EXIF orientation,
+16-bit PNG and TIFF round trips with their ICC profiles).

@@ -1,6 +1,6 @@
 [project]
 name = "upscale-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server that runs open-weight image upscaling models locally (spandrel + PyTorch, Apple MPS)"
 readme = "README.md"
 # PEP 639 licence metadata (SPDX expression plus the file that ships with it).
@@ -16,6 +16,12 @@ dependencies = [
     "spandrel>=0.4",
     "pillow>=10.1",
     "numpy>=1.26",
+    # HEIC/HEIF/AVIF input at full bit depth.
+    "pillow-heif>=0.18",
+    # 16-bit PNG/TIFF pixels (Pillow truncates 48/64-bit RGB to 8 bits).
+    "opencv-python-headless>=4.9",
+    # 16-bit TIFF output with an embedded ICC profile.
+    "tifffile>=2024.1",
 ]
 
 [project.scripts]

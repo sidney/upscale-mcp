@@ -108,7 +108,9 @@ mcp = MCPServer(
         "paths are taken from the first read root (inputs) and the write root (outputs). "
         "Use output_scale=1 to upscale and then resize back to the original size, which "
         "keeps the model's added detail and lets the result line up pixel for pixel with "
-        "the original for compositing. Every upscale runs as a job: if your client gives "
+        "the original for compositing. Inputs may be HEIC/HEIF/AVIF and 16-bit PNG/TIFF as well "
+        "as the usual formats; images deeper than 8 bits stay 16-bit through the model and are "
+        "written as 16-bit PNG/TIFF (JPEG/WebP output is 8-bit). Every upscale runs as a job: if your client gives "
         "up on calls after a minute or so, pass wait_seconds (e.g. 45) and, while the "
         "returned status is queued or running, call job_status with the job id and "
         "wait_seconds again until it is done. AI upscalers invent plausible detail; they "
@@ -217,7 +219,12 @@ async def upscale(
     ctx: Context,
     input: Annotated[
         str,
-        Field(description="Input image: absolute path inside a read root, or relative to the first read root."),
+        Field(
+            description=(
+                "Input image: absolute path inside a read root, or relative to the first read root. "
+                "Anything Pillow reads, plus HEIC/HEIF/AVIF and 16-bit PNG/TIFF (kept at 16 bits)."
+            )
+        ),
     ],
     model: Annotated[
         str,
@@ -228,8 +235,8 @@ async def upscale(
         Field(
             description=(
                 "Output path (absolute inside the write root, or relative to it). The suffix picks "
-                "the format: .png .jpg .tif .webp. Default: <input stem>.<model stem>.<scale>.png "
-                "in the write root."
+                "the format: .png .jpg .tif .webp; .png and .tif keep 16 bits for a deeper source. "
+                "Default: <input stem>.<model stem>.<scale>.png in the write root."
             )
         ),
     ] = None,
