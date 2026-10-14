@@ -89,7 +89,7 @@ Add to `mcpServers` in
 - `device_info`: torch version, device in use, roots, models folders.
 - `list_models`: model files with architecture, purpose, scale and whether
   they support half precision.
-- `upscale`: run one model over one image.
+- `upscale`: run one model over one image, as a background job.
   - `input`: inside a read root; relative paths start at the first read root.
   - `model`: file name or stem from `list_models`.
   - `output`: inside the write root (relative paths start there); the suffix
@@ -100,6 +100,25 @@ Add to `mcpServers` in
     size, or any other multiple of the input size (LANCZOS resize).
   - `tile_size` (default 512, 0 = one pass), `tile_overlap` (default 32),
     `half` (float16 on the GPU), `jpeg_quality`.
+  - `wait_seconds`: omit to wait until the job is done and get the result
+    from the same call; `0` to get the job id back at once; anything else to
+    wait up to that long. The reply is the job's status, with the result
+    under `result` once it is `done`.
+- `job_status`: one job's status, tile progress and, when done, its result.
+  `wait_seconds` (default 0) waits up to that long for it to finish first.
+- `jobs_list`: recent jobs, newest first.
+- `jobs_cancel`: cancel a queued job, or stop a running one after its current
+  tile. A cancelled job writes no output.
+
+Jobs run one at a time on the GPU. Some clients give
+up on a call long before a slow model finishes (a Claude cloud session
+reaching the Mac through the desktop app waits 60 seconds), so such a client
+should pass `wait_seconds` of about 45 and keep calling `job_status` while
+the status is `queued` or `running`. A job shows 0 of 0 tiles while its model
+is loading.
+
+Outputs are written to a hidden temporary file and renamed into place, so a
+file that exists under its final name is always complete.
 
 The EXIF orientation is applied to the pixels and the ICC profile is copied
 to the output. Alpha is carried through with a plain LANCZOS resize, not the
@@ -130,4 +149,6 @@ uv run pytest
 The tests need no model weights or GPU: they check that tiled and
 single-pass output are identical for a model with a known receptive field,
 the padding for architectures with size requirements, progress reporting,
-path confinement and model-name resolution.
+path confinement, model-name resolution, the job queue (one at a time,
+cancelling queued and running jobs, refusing two jobs on one output) and
+atomic saves.

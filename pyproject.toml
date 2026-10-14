@@ -1,6 +1,6 @@
 [project]
 name = "upscale-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that runs open-weight image upscaling models locally (spandrel + PyTorch, Apple MPS)"
 readme = "README.md"
 # PEP 639 licence metadata (SPDX expression plus the file that ships with it).

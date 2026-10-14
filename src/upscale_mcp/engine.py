@@ -44,8 +44,18 @@ from spandrel import ImageModelDescriptor, ModelLoader  # noqa: E402
 # .safetensors is a plain tensor container and safe by construction.
 MODEL_SUFFIXES = (".pth", ".pt", ".safetensors", ".ckpt")
 
-# Output formats we know how to write, keyed by lower-case suffix.
-OUTPUT_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp")
+# Output formats we know how to write: lower-case suffix -> PIL format name.
+# The format is passed to PIL explicitly because the file is first written
+# under a temporary name (see save_image), whose suffix PIL would not know.
+OUTPUT_FORMATS = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".tif": "TIFF",
+    ".tiff": "TIFF",
+    ".webp": "WEBP",
+}
+OUTPUT_SUFFIXES = tuple(OUTPUT_FORMATS)
 
 ProgressFn = Callable[[int, int], None]
 
@@ -413,6 +423,12 @@ def save_image(
 ) -> list[str]:
     """Write the result; the format comes from the file suffix.
 
+    The image is written to a hidden temporary file in the same folder and
+    then renamed over the final name. A rename within one folder is atomic,
+    so the final file either does not exist or is complete: anything watching
+    for it (a person, or Claude polling the folder) never sees a half-written
+    image, and a job killed mid-save leaves only the hidden temp file.
+
     Returns warnings (for example alpha dropped for JPEG) for the caller.
     """
     warnings: list[str] = []
@@ -438,7 +454,12 @@ def save_image(
         kwargs["compression"] = "tiff_lzw"
     elif suffix == ".webp":
         kwargs["lossless"] = True
-    im.save(path, **kwargs)
+    tmp = path.with_name(f".{path.name}.partial")
+    try:
+        im.save(tmp, format=OUTPUT_FORMATS[suffix], **kwargs)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)  # only still there if save or rename failed
     return warnings
 
 

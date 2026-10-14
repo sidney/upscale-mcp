@@ -14,11 +14,15 @@ log file.
 Tools:
   device_info  - torch version, the device in use, roots, models folders
   list_models  - model files found, with what spandrel reports about each
-  upscale      - run one model over one image and write the result
+  upscale      - start one model over one image; wait for it, or not
+  job_status   - state of one job, optionally waiting for it to finish
+  jobs_list    - recent jobs, newest first
+  jobs_cancel  - cancel a queued job, or stop a running one after its tile
 
-The heavy work runs in a worker thread (anyio.to_thread) so the server keeps
-answering the client while a model runs, and one lock serialises jobs so two
-calls never compete for GPU memory.
+Every upscale runs as a background job (see jobs.py) so a caller with a short
+call timeout can take the job id and poll, while a caller that can wait gets
+the finished result from the same call as before. The handlers stay async
+and poll the job, so the server keeps answering while a model runs.
 
 No `from __future__ import annotations` here on purpose: MCPServer builds each
 tool's JSON schema, and finds the Context parameter, by inspecting the real
@@ -28,24 +32,26 @@ annotation objects. String annotations can defeat that in some SDK versions.
 import argparse
 import logging
 import sys
-import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
 
 import anyio
-import anyio.from_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from . import __version__, engine
+from .jobs import Job, JobManager
 from .roots import Roots
 
 log = logging.getLogger("upscale_mcp")
 
 DEFAULT_MODELS_DIR = Path("~/.local/share/upscale-mcp/models")
+
+# How often a waiting handler checks its job and forwards tile progress.
+_POLL_SECONDS = 0.25
 
 
 class _State:
@@ -56,7 +62,7 @@ class _State:
         self.models_dirs = models_dirs
         self.device = device
         self.cache = cache
-        self.job_lock = threading.Lock()
+        self.jobs = JobManager()
 
 
 _state: _State | None = None
@@ -92,8 +98,6 @@ def _as_tool_errors() -> Iterator[None]:
         raise ToolError(f"{type(exc).__name__}: {exc}") from exc
 
 
-# Everything after the name by keyword: in SDK 2.x the second positional
-# parameter is `title`, so a positional instructions string would land there.
 mcp = MCPServer(
     "upscale-mcp",
     version=__version__,
@@ -104,9 +108,54 @@ mcp = MCPServer(
         "paths are taken from the first read root (inputs) and the write root (outputs). "
         "Use output_scale=1 to upscale and then resize back to the original size, which "
         "keeps the model's added detail and lets the result line up pixel for pixel with "
-        "the original for compositing. AI upscalers invent plausible detail; they do not "
-        "recover detail the camera did not capture."
+        "the original for compositing. Every upscale runs as a job: if your client gives "
+        "up on calls after a minute or so, pass wait_seconds (e.g. 45) and, while the "
+        "returned status is queued or running, call job_status with the job id and "
+        "wait_seconds again until it is done. AI upscalers invent plausible detail; they "
+        "do not recover detail the camera did not capture."
     ),
+)
+
+
+async def _await_job(ctx: Context, job: Job, wait_seconds: float | None) -> dict:
+    """Wait for `job` up to `wait_seconds` (None = until finished); return its snapshot.
+
+    While waiting, tile progress is forwarded as MCP progress notifications.
+    A job that failed or was cancelled while we waited becomes a ToolError, so
+    the call is marked as an error; one still running is returned normally
+    with status "queued"/"running" for the caller to poll.
+    """
+    deadline = None if wait_seconds is None else anyio.current_time() + wait_seconds
+    reported = (0, 0)
+
+    async def report() -> None:
+        nonlocal reported
+        if job.total and (job.done, job.total) != reported:
+            reported = (job.done, job.total)
+            try:
+                await ctx.report_progress(job.done, job.total)
+            except Exception:
+                pass  # a client that did not ask for progress ignores it
+
+    while not job.finished.is_set():
+        if deadline is not None and anyio.current_time() >= deadline:
+            break
+        await report()
+        await anyio.sleep(_POLL_SECONDS)
+    # The last tile can finish between two polls; send its update too, so a
+    # client watching progress sees the job reach N of N.
+    await report()
+    snap = job.snapshot()
+    if job.finished.is_set() and job.status != "done":
+        detail = f": {job.error}" if job.error else ""
+        raise ToolError(f"job {job.id} {job.status}{detail}")
+    return snap
+
+
+_WAIT_DESCRIPTION = (
+    "Seconds to wait for the job to finish before returning. Omit to wait until it is done. "
+    "0 returns the job id at once. A client that times out calls after about a minute "
+    "should pass about 45 and poll job_status while the status is queued or running."
 )
 
 
@@ -210,45 +259,25 @@ async def upscale(
     ] = False,
     jpeg_quality: Annotated[int, Field(ge=1, le=100, description="Quality for .jpg output.")] = 95,
     overwrite: Annotated[bool, Field(description="Replace an existing output file.")] = False,
+    wait_seconds: Annotated[float | None, Field(ge=0, le=3600, description=_WAIT_DESCRIPTION)] = None,
 ) -> dict:
-    """Upscale (or restore) one image with one model and write the result under the write root."""
+    """Upscale (or restore) one image with one model, writing the result under the write root.
+
+    Returns the job's status. When the job is done, `result` holds the output
+    path, sizes, model details, device and timing.
+    """
     with _as_tool_errors():
-        return await _upscale(
-            ctx, input, model, output, output_scale, tile_size, tile_overlap, half, jpeg_quality, overwrite
+        st = _st()
+        # Validate everything that can be checked up front, so mistakes come
+        # back immediately instead of as a failed job.
+        src = st.roots.input_path(input)
+        model_path = engine.resolve_model(model, st.models_dirs)
+        dst = st.roots.output_path(
+            output if output else _default_output_name(src, model_path, output_scale),
+            overwrite=overwrite,
         )
 
-
-async def _upscale(
-    ctx: Context,
-    input: str,
-    model: str,
-    output: str | None,
-    output_scale: float | None,
-    tile_size: int,
-    tile_overlap: int,
-    half: bool,
-    jpeg_quality: int,
-    overwrite: bool,
-) -> dict:
-    st = _st()
-    src = st.roots.input_path(input)
-    model_path = engine.resolve_model(model, st.models_dirs)
-    dst = st.roots.output_path(
-        output if output else _default_output_name(src, model_path, output_scale),
-        overwrite=overwrite,
-    )
-
-    def report(done: int, total: int) -> None:
-        # Called from the worker thread after every tile; hop back onto the
-        # event loop to send an MCP progress notification. A client that did
-        # not ask for progress simply ignores it, so failures are harmless.
-        try:
-            anyio.from_thread.run(ctx.report_progress, done, total)
-        except Exception:
-            pass
-
-    def work() -> dict:
-        with st.job_lock:
+        def work(progress) -> dict:
             log.info("upscale %s with %s -> %s on %s", src, model_path.name, dst, st.device)
             result = engine.upscale_file(
                 src,
@@ -261,12 +290,46 @@ async def _upscale(
                 overlap=tile_overlap,
                 half=half,
                 jpeg_quality=jpeg_quality,
-                progress=report,
+                progress=progress,
             )
             log.info("done in %.1fs", result.seconds)
             return result.as_dict()
 
-    return await anyio.to_thread.run_sync(work)
+        job = st.jobs.submit(input=str(src), model=model_path.name, output=dst, work=work)
+        return await _await_job(ctx, job, wait_seconds)
+
+
+@mcp.tool()
+async def job_status(
+    ctx: Context,
+    job: Annotated[str, Field(description="Job id returned by upscale, e.g. 'j3'.")],
+    wait_seconds: Annotated[
+        float,
+        Field(ge=0, le=3600, description="Seconds to wait for the job to finish before answering; 0 = answer now."),
+    ] = 0,
+) -> dict:
+    """Report one job's status, progress and, once done, its result."""
+    with _as_tool_errors():
+        return await _await_job(ctx, _st().jobs.get(job), wait_seconds)
+
+
+@mcp.tool()
+def jobs_list() -> dict:
+    """List recent jobs (queued, running and the last finished ones), newest first."""
+    return {"jobs": _st().jobs.list()}
+
+
+@mcp.tool()
+def jobs_cancel(
+    job: Annotated[str, Field(description="Job id to cancel.")],
+) -> dict:
+    """Cancel a queued job, or stop a running one after the tile it is working on.
+
+    A running job stops at the next tile boundary, so the returned status may
+    still be "running"; check job_status. A cancelled job writes no output.
+    """
+    with _as_tool_errors():
+        return _st().jobs.cancel(job).snapshot()
 
 
 # --------------------------------------------------------------------------
